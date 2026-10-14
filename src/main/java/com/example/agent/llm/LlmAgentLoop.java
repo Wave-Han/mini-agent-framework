@@ -60,11 +60,9 @@ public class LlmAgentLoop {
             String response = client.chat(model, messages, toJson(toolDefinitions));
             System.out.println("[LLM Response] " + truncate(response, 300));
 
-            // 2. 解析响应
-            Map<String, Object> parsed = parseResponse(response);
-            String content = (String) parsed.get("content");
-            @SuppressWarnings("unchecked")
-            List<Map<String, Object>> toolCalls = (List<Map<String, Object>>) parsed.get("tool_calls");
+            // 2. 解析响应（Jackson-backed，见 ToolCallParser）
+            String content = ToolCallParser.extractContent(response);
+            List<Map<String, Object>> toolCalls = ToolCallParser.parseToolCalls(response);
 
             // 追加 assistant 消息到历史
             Map<String, Object> msgEntry = new LinkedHashMap<>();
@@ -145,131 +143,6 @@ public class LlmAgentLoop {
             defs.add(def);
         }
         return defs;
-    }
-
-    private Map<String, Object> parseResponse(String json) {
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("content", extractStringField(json, "content"));
-        String toolCallsStr = extractArrayField(json, "tool_calls");
-        if (toolCallsStr != null && !toolCallsStr.isEmpty() && !toolCallsStr.equals("null")) {
-            result.put("tool_calls", parseToolCalls(toolCallsStr));
-        }
-        return result;
-    }
-
-    private String extractStringField(String json, String fieldName) {
-        String pattern = "\"" + fieldName + "\":\"";
-        int start = json.indexOf(pattern);
-        if (start == -1) {
-            pattern = "\"" + fieldName + "\": \"";
-            start = json.indexOf(pattern);
-            if (start == -1) return "";
-            start += pattern.length();
-        } else {
-            start += pattern.length();
-        }
-        StringBuilder sb = new StringBuilder();
-        for (int i = start; i < json.length(); i++) {
-            char c = json.charAt(i);
-            if (c == '"' && i > 0 && json.charAt(i - 1) != '\\') break;
-            if (c == '\\' && i + 1 < json.length()) {
-                char next = json.charAt(i + 1);
-                if (next == 'n') { sb.append('\n'); i++; continue; }
-                if (next == 't') { sb.append('\t'); i++; continue; }
-                if (next == '"') { sb.append('"'); i++; continue; }
-                if (next == '\\') { sb.append('\\'); i++; continue; }
-            }
-            sb.append(c);
-        }
-        return sb.toString();
-    }
-
-    private String extractArrayField(String json, String fieldName) {
-        String pattern = "\"" + fieldName + "\":[";
-        int start = json.indexOf(pattern);
-        if (start == -1) {
-            pattern = "\"" + fieldName + "\": [";
-            start = json.indexOf(pattern);
-            if (start == -1) return null;
-        }
-        start = json.indexOf('[', start);
-        int depth = 0;
-        int end = start;
-        for (int i = start; i < json.length(); i++) {
-            char c = json.charAt(i);
-            if (c == '[') depth++;
-            if (c == ']') depth--;
-            if (depth == 0) { end = i + 1; break; }
-        }
-        return json.substring(start, end);
-    }
-
-    private List<Map<String, Object>> parseToolCalls(String json) {
-        List<Map<String, Object>> calls = new ArrayList<>();
-        int pos = 0;
-        while (true) {
-            int funcIdx = json.indexOf("\"function\"", pos);
-            if (funcIdx == -1) break;
-            String name = extractStringField(json.substring(funcIdx), "name");
-            Map<String, Object> argsMap = parseArgumentsToMap(json.substring(funcIdx));
-            Map<String, Object> call = new LinkedHashMap<>();
-            Map<String, Object> function = new LinkedHashMap<>();
-            function.put("name", name);
-            function.put("arguments", argsMap);
-            call.put("function", function);
-            calls.add(call);
-            pos = funcIdx + 10;
-        }
-        return calls;
-    }
-
-    private Map<String, Object> parseArgumentsToMap(String json) {
-        Map<String, Object> result = new LinkedHashMap<>();
-        String pattern = "\"arguments\":";
-        int start = json.indexOf(pattern);
-        if (start == -1) return result;
-        start += pattern.length();
-        while (start < json.length() && json.charAt(start) == ' ') start++;
-        if (start >= json.length() || json.charAt(start) != '{') return result;
-        int depth = 0;
-        int end = start;
-        for (int i = start; i < json.length(); i++) {
-            char c = json.charAt(i);
-            if (c == '{') depth++;
-            if (c == '}') depth--;
-            if (depth == 0) { end = i; break; }
-        }
-        String raw = json.substring(start + 1, end).trim();
-        if (raw.isEmpty()) return result;
-        String[] pairs = raw.split(",");
-        for (String pair : pairs) {
-            String[] kv = pair.split(":", 2);
-            if (kv.length == 2) {
-                String key = kv[0].trim().replace("\"", "");
-                String value = kv[1].trim().replace("\"", "");
-                result.put(key, value);
-            }
-        }
-        return result;
-    }
-
-    private Map<String, Object> parseArguments(String argsJson) {
-        Map<String, Object> result = new HashMap<>();
-        if (argsJson == null || argsJson.isEmpty() || argsJson.equals("null")) return result;
-        String cleaned = argsJson.trim();
-        if (cleaned.startsWith("{") && cleaned.endsWith("}")) {
-            cleaned = cleaned.substring(1, cleaned.length() - 1);
-        }
-        String[] pairs = cleaned.split(",");
-        for (String pair : pairs) {
-            String[] kv = pair.split(":", 2);
-            if (kv.length == 2) {
-                String key = kv[0].trim().replace("\"", "");
-                String value = kv[1].trim().replace("\"", "");
-                result.put(key, value);
-            }
-        }
-        return result;
     }
 
     private String toJson(Object obj) {
