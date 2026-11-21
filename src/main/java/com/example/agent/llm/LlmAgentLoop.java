@@ -6,6 +6,7 @@ import com.example.agent.spec.AgentTool;
 import com.example.agent.spec.ToolResult;
 
 import java.util.*;
+import java.util.function.Consumer;
 
 /**
  * LlmAgentLoop —— 真正的 LLM Agent 循环
@@ -20,6 +21,10 @@ import java.util.*;
  *     3. 如果有 tool_calls -> 执行工具 -> 结果追加到消息 -> 继续
  *     4. 如果是纯文本 -> 返回给用户 -> break
  *   }
+ *
+ * Streaming is opt-in via {@link #enableStreaming(Consumer)}: content chunks are
+ * forwarded live to the consumer while tool_calls fragments buffer silently;
+ * the assembled response keeps the same contract as the blocking path.
  */
 public class LlmAgentLoop {
 
@@ -30,6 +35,8 @@ public class LlmAgentLoop {
     private final AgentLoop toolExecutor;
     private final List<AgentTool> tools;
     private final List<Map<String, Object>> toolDefinitions;
+    private boolean streaming = false;
+    private Consumer<String> onDelta = null;
 
     public LlmAgentLoop(OllamaClient client, String model, List<AgentTool> tools,
                         List<ToolInterceptor> interceptors) {
@@ -38,6 +45,13 @@ public class LlmAgentLoop {
         this.tools = tools;
         this.toolExecutor = new AgentLoop(tools, interceptors);
         this.toolDefinitions = buildToolDefinitions(tools);
+    }
+
+    /** Opt in to streaming turns; content deltas are forwarded live to onDelta (nullable). */
+    public LlmAgentLoop enableStreaming(Consumer<String> onDelta) {
+        this.streaming = true;
+        this.onDelta = onDelta;
+        return this;
     }
 
     /**
@@ -57,7 +71,9 @@ public class LlmAgentLoop {
 
             // 1. 调用 LLM
             System.out.println("[LLM Request] 发送 " + messages.size() + " 条消息...");
-            String response = client.chat(model, messages, toJson(toolDefinitions));
+            String response = streaming
+                ? client.chatStream(model, messages, toJson(toolDefinitions), onDelta)
+                : client.chat(model, messages, toJson(toolDefinitions));
             System.out.println("[LLM Response] " + truncate(response, 300));
 
             // 2. 解析响应（Jackson-backed，见 ToolCallParser）

@@ -88,16 +88,19 @@ The suite pins the behaviors that matter:
 
 - `AgentTool.parameterSchema()` is not yet wired into the tool definitions sent
   to the LLM (`properties` is emitted empty).
-- `AgentSession.buildContext()` has no token-window trimming; long conversations
-  will outgrow the context window.
 - `AgentLoop` uses an unbounded cached thread pool.
 - `ModelRegistry` (Spring AI `ChatModel`) and `OllamaClient` are two provider
   paths that are not yet unified.
 
+## Streaming & Context Budgeting (v0.2.0)
+
+- **Streaming (opt-in)**: `new LlmAgentLoop(...).enableStreaming(delta -> print(delta))` — content chunks arrive live; fragmented `tool_calls` are buffered and assembled, the loop contract is unchanged. `OllamaClient.chatStream` speaks NDJSON via `OllamaStreamParser`; request bodies are Jackson-built (the hand-rolled builder corrupted quotes/newlines).
+- **Context budget**: `session.buildContext(maxTokens, new HeuristicTokenEstimator())` — system messages always kept, newest entries admitted backwards until the budget, dropped middle summarized by one `trim_marker`, and a `tool_result` never loses the assistant turn it answers. Swap in a real tokenizer by implementing `TokenEstimator`.
+
 ## Roadmap
 
 - [ ] Wire `parameterSchema()` into `buildToolDefinitions()`
-- [ ] Token-aware context trimming in `AgentSession`
+- [x] Token-aware context trimming in `AgentSession` (v0.2.0)
 - [ ] Bounded executor + timeouts in `AgentLoop`
 - [ ] Unify providers behind one `ChatModel` path
 
