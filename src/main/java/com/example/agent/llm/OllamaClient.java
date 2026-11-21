@@ -1,13 +1,20 @@
 package com.example.agent.llm;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
+import java.util.stream.Stream;
 
 /**
  * OllamaClient —— Ollama HTTP API 客户端
@@ -18,10 +25,15 @@ import java.util.Map;
  * Ollama API:
  *   POST /api/chat  — 对应 OpenAI Chat Completions API
  *   支持 tools 参数实现 Tool Calling（需要模型支持）
+ *   stream:true 返回 NDJSON 行流，由 OllamaStreamParser 汇聚
+ *
+ * Request bodies are built with Jackson: the previous hand-rolled builder
+ * corrupted quotes, newlines and backslashes inside message content.
  */
 public class OllamaClient {
 
     private static final String DEFAULT_BASE_URL = "http://localhost:11434";
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final String baseUrl;
     private final HttpClient httpClient;
@@ -38,30 +50,14 @@ public class OllamaClient {
     }
 
     /**
-     * 发送 Chat 请求 —— 核心方法
-     *
-     * 对应 pi-mono 中 Model.processRequest()
-     * 对应 Spring AI 中 ChatModel.call(Prompt)
-     *
-     * @param model    模型名称，如 "deepseek-r1:8b"
-     * @param messages 消息列表
-     * @param tools    工具定义（JSON 字符串）
-     * @return Ollama 响应（原始 JSON 字符串）
+     * 发送 Chat 请求（阻塞，stream:false）—— 降级路径
      */
     public String chat(String model, List<Map<String, Object>> messages, String toolsJson) {
-        StringBuilder body = new StringBuilder();
-        body.append("{\"model\":\"").append(model).append("\"");
-        body.append(",\"messages\":").append(toJsonArray(messages));
-        body.append(",\"stream\":false");
-        if (toolsJson != null && !toolsJson.isEmpty()) {
-            body.append(",\"tools\":").append(toolsJson);
-        }
-        body.append("}");
-
         HttpRequest request = HttpRequest.newBuilder()
             .uri(URI.create(baseUrl + "/api/chat"))
             .header("Content-Type", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
+            .POST(HttpRequest.BodyPublishers.ofString(
+                buildRequestBody(model, messages, toolsJson, false)))
             .timeout(Duration.ofMinutes(5))
             .build();
 
@@ -71,6 +67,38 @@ public class OllamaClient {
                 throw new RuntimeException("Ollama API error: " + response.statusCode() + " " + response.body());
             }
             return response.body();
+        } catch (IOException | InterruptedException e) {
+            throw new RuntimeException("Ollama API call failed: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 发送流式 Chat 请求（stream:true，NDJSON 行流）
+     *
+     * Content chunks are forwarded live to onDelta (nullable); tool_calls fragments
+     * are buffered inside the parser. Returns the assembled canonical flat response
+     * JSON — same contract as chat()'s consumers expect (ToolCallParser shape).
+     */
+    public String chatStream(String model, List<Map<String, Object>> messages, String toolsJson,
+                             Consumer<String> onDelta) {
+        HttpRequest request = HttpRequest.newBuilder()
+            .uri(URI.create(baseUrl + "/api/chat"))
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(
+                buildRequestBody(model, messages, toolsJson, true)))
+            .timeout(Duration.ofMinutes(5))
+            .build();
+
+        try {
+            HttpResponse<Stream<String>> response = httpClient.send(request, HttpResponse.BodyHandlers.ofLines());
+            if (response.statusCode() != 200) {
+                throw new RuntimeException("Ollama API error: " + response.statusCode());
+            }
+            OllamaStreamParser parser = new OllamaStreamParser();
+            try (Stream<String> lines = response.body()) {
+                lines.forEach(line -> parser.accept(line, onDelta));
+            }
+            return parser.toResponseJson();
         } catch (IOException | InterruptedException e) {
             throw new RuntimeException("Ollama API call failed: " + e.getMessage(), e);
         }
@@ -90,55 +118,26 @@ public class OllamaClient {
         }
     }
 
-    // ---- 简易 JSON 构建 ----
+    // ---- 请求体构建（Jackson-backed，可测） ----
 
-    private String toJsonArray(List<Map<String, Object>> list) {
-        StringBuilder sb = new StringBuilder("[");
-        for (int i = 0; i < list.size(); i++) {
-            if (i > 0) sb.append(",");
-            sb.append(toJsonObject(list.get(i)));
-        }
-        sb.append("]");
-        return sb.toString();
-    }
-
-    private String toJsonObject(Map<String, Object> map) {
-        StringBuilder sb = new StringBuilder("{");
-        boolean first = true;
-        for (Map.Entry<String, Object> entry : map.entrySet()) {
-            if (!first) sb.append(",");
-            first = false;
-            sb.append("\"").append(entry.getKey()).append("\":");
-            sb.append(valueToJson(entry.getValue()));
-        }
-        sb.append("}");
-        return sb.toString();
-    }
-
-    @SuppressWarnings("unchecked")
-    private String valueToJson(Object value) {
-        if (value == null) return "null";
-        if (value instanceof String) return "\"" + escapeJson((String) value) + "\"";
-        if (value instanceof Number || value instanceof Boolean) return value.toString();
-        if (value instanceof Map) return toJsonObject((Map<String, Object>) value);
-        if (value instanceof List) {
-            List<?> list = (List<?>) value;
-            StringBuilder sb = new StringBuilder("[");
-            for (int i = 0; i < list.size(); i++) {
-                if (i > 0) sb.append(",");
-                sb.append(valueToJson(list.get(i)));
+    /** Builds the /api/chat request body; toolsJson is embedded verbatim when present. */
+    static String buildRequestBody(String model, List<Map<String, Object>> messages,
+                                   String toolsJson, boolean stream) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("model", model);
+        body.put("messages", messages);
+        body.put("stream", stream);
+        if (toolsJson != null && !toolsJson.isEmpty()) {
+            try {
+                body.put("tools", MAPPER.readTree(toolsJson));
+            } catch (JsonProcessingException e) {
+                throw new IllegalArgumentException("toolsJson is not valid JSON: " + e.getMessage(), e);
             }
-            sb.append("]");
-            return sb.toString();
         }
-        return "\"" + escapeJson(value.toString()) + "\"";
-    }
-
-    private String escapeJson(String s) {
-        return s.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\t", "\\t");
+        try {
+            return MAPPER.writeValueAsString(body);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Failed to serialize request body: " + e.getMessage(), e);
+        }
     }
 }
