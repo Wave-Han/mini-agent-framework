@@ -32,4 +32,14 @@ class OllamaClientTest {
         assertThat(root.has("tools")).isFalse();
         assertThat(root.path("messages").get(0).path("content").asText()).isEqualTo("hi");
     }
+
+    /** Review finding Important#1: non-200 must drain the body into the error message. */
+    @Test
+    void errorFromStream_includesStatusAndDrainedBody() {
+        var lines = java.util.stream.Stream.of("{\"error\":\"model not found\"}");
+        var ex = OllamaClient.errorFromStream(404, lines);
+        assertThat(ex).isInstanceOf(RuntimeException.class)
+            .hasMessageContaining("404")
+            .hasMessageContaining("model not found");
+    }
 }

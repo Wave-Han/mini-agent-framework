@@ -4,6 +4,8 @@ import com.example.agent.harness.AgentLoop;
 import com.example.agent.interceptor.ToolInterceptor;
 import com.example.agent.spec.AgentTool;
 import com.example.agent.spec.ToolResult;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.util.*;
 import java.util.function.Consumer;
@@ -29,12 +31,13 @@ import java.util.function.Consumer;
 public class LlmAgentLoop {
 
     private static final int MAX_ITERATIONS = 10;
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final OllamaClient client;
     private final String model;
     private final AgentLoop toolExecutor;
     private final List<AgentTool> tools;
-    private final List<Map<String, Object>> toolDefinitions;
+    private final String toolDefinitionsJson;
     private boolean streaming = false;
     private Consumer<String> onDelta = null;
 
@@ -44,7 +47,7 @@ public class LlmAgentLoop {
         this.model = model;
         this.tools = tools;
         this.toolExecutor = new AgentLoop(tools, interceptors);
-        this.toolDefinitions = buildToolDefinitions(tools);
+        this.toolDefinitionsJson = toolDefinitionsJson(tools);
     }
 
     /** Opt in to streaming turns; content deltas are forwarded live to onDelta (nullable). */
@@ -72,8 +75,8 @@ public class LlmAgentLoop {
             // 1. 调用 LLM
             System.out.println("[LLM Request] 发送 " + messages.size() + " 条消息...");
             String response = streaming
-                ? client.chatStream(model, messages, toJson(toolDefinitions), onDelta)
-                : client.chat(model, messages, toJson(toolDefinitions));
+                ? client.chatStream(model, messages, toolDefinitionsJson, onDelta)
+                : client.chat(model, messages, toolDefinitionsJson);
             System.out.println("[LLM Response] " + truncate(response, 300));
 
             // 2. 解析响应（Jackson-backed，见 ToolCallParser）
@@ -146,7 +149,12 @@ public class LlmAgentLoop {
         return sb.toString();
     }
 
-    private List<Map<String, Object>> buildToolDefinitions(List<AgentTool> tools) {
+    /**
+     * Tool definitions serialized with Jackson — the previous hand-rolled builder
+     * emitted string values without any escaping, so a description containing
+     * quotes or newlines produced invalid JSON (review finding).
+     */
+    static String toolDefinitionsJson(List<AgentTool> tools) {
         List<Map<String, Object>> defs = new ArrayList<>();
         for (AgentTool tool : tools) {
             Map<String, Object> def = new LinkedHashMap<>();
@@ -158,38 +166,11 @@ public class LlmAgentLoop {
             def.put("function", function);
             defs.add(def);
         }
-        return defs;
-    }
-
-    private String toJson(Object obj) {
-        if (obj instanceof String) return (String) obj;
-        if (obj instanceof List) {
-            StringBuilder sb = new StringBuilder("[");
-            List<?> list = (List<?>) obj;
-            for (int i = 0; i < list.size(); i++) {
-                if (i > 0) sb.append(",");
-                sb.append(toJson(list.get(i)));
-            }
-            sb.append("]");
-            return sb.toString();
+        try {
+            return MAPPER.writeValueAsString(defs);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Failed to serialize tool definitions: " + e.getMessage(), e);
         }
-        if (obj instanceof Map) {
-            StringBuilder sb = new StringBuilder("{");
-            Map<?, ?> map = (Map<?, ?>) obj;
-            boolean first = true;
-            for (Map.Entry<?, ?> e : map.entrySet()) {
-                if (!first) sb.append(",");
-                first = false;
-                sb.append("\"").append(e.getKey()).append("\":");
-                Object v = e.getValue();
-                if (v instanceof String) sb.append("\"").append(v).append("\"");
-                else if (v instanceof Map || v instanceof List) sb.append(toJson(v));
-                else sb.append(v);
-            }
-            sb.append("}");
-            return sb.toString();
-        }
-        return obj.toString();
     }
 
     private String truncate(String s, int max) {

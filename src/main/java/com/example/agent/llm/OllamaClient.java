@@ -91,14 +91,15 @@ public class OllamaClient {
 
         try {
             HttpResponse<Stream<String>> response = httpClient.send(request, HttpResponse.BodyHandlers.ofLines());
-            if (response.statusCode() != 200) {
-                throw new RuntimeException("Ollama API error: " + response.statusCode());
-            }
-            OllamaStreamParser parser = new OllamaStreamParser();
+            // try-with-resources wraps BOTH paths: a non-200 must not leak the stream
             try (Stream<String> lines = response.body()) {
+                if (response.statusCode() != 200) {
+                    throw errorFromStream(response.statusCode(), lines);
+                }
+                OllamaStreamParser parser = new OllamaStreamParser();
                 lines.forEach(line -> parser.accept(line, onDelta));
+                return parser.toResponseJson();
             }
-            return parser.toResponseJson();
         } catch (IOException | InterruptedException e) {
             throw new RuntimeException("Ollama API call failed: " + e.getMessage(), e);
         }
@@ -119,6 +120,15 @@ public class OllamaClient {
     }
 
     // ---- 请求体构建（Jackson-backed，可测） ----
+
+    /** Drains the (already-open) error body into a RuntimeException carrying status + body. */
+    static RuntimeException errorFromStream(int statusCode, Stream<String> lines) {
+        String body = lines.collect(java.util.stream.Collectors.joining("\n"));
+        if (body.length() > 500) {
+            body = body.substring(0, 500);
+        }
+        return new RuntimeException("Ollama API error: " + statusCode + " " + body);
+    }
 
     /** Builds the /api/chat request body; toolsJson is embedded verbatim when present. */
     static String buildRequestBody(String model, List<Map<String, Object>> messages,
