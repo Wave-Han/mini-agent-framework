@@ -58,7 +58,7 @@ pipeline locally. For a real LLM round trip, run `LlmAgentDemo` with a local
 ## Testing
 
 ```bash
-mvn test    # 18 tests, green
+mvn test    # 32 tests, green
 ```
 
 The suite pins the behaviors that matter:
