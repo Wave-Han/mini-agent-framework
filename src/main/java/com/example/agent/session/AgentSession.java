@@ -96,6 +96,15 @@ public class AgentSession {
         return Collections.unmodifiableList(path);
     }
 
+    /**
+     * 构建带 token 预算的上下文 —— head+tail 裁剪（见 ContextTrimmer 策略说明）。
+     * system 消息永远保留，tool_result 与其发起消息成对保留，中间被裁部分以
+     * trim_marker 占位；最新一条永远在场。无预算版本见 {@link #buildContext()}。
+     */
+    public List<SessionEntry> buildContext(int maxTokens, TokenEstimator estimator) {
+        return ContextTrimmer.trim(buildContext(), maxTokens, estimator);
+    }
+
     public String getSessionId() { return sessionId; }
     public String getCwd() { return cwd; }
     public String getLeafId() { return leafId; }
